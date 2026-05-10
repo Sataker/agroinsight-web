@@ -1,152 +1,226 @@
-const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+import { supabase } from "./supabase";
 
 class ApiClient {
-  private token: string | null = null;
+  private userId: string | null = null;
 
-  setToken(token: string) {
-    this.token = token;
-    if (typeof window !== "undefined") {
-      localStorage.setItem("agroinsight_token", token);
-    }
-  }
-
-  getToken(): string | null {
-    if (this.token) return this.token;
-    if (typeof window !== "undefined") {
-      this.token = localStorage.getItem("agroinsight_token");
-    }
-    return this.token;
-  }
-
-  clearToken() {
-    this.token = null;
-    if (typeof window !== "undefined") {
-      localStorage.removeItem("agroinsight_token");
-    }
-  }
-
-  private async request<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const token = this.getToken();
-    const headers: Record<string, string> = {
-      "Content-Type": "application/json",
-      ...((options.headers as Record<string, string>) || {}),
-    };
-
-    if (token) {
-      headers["Authorization"] = `Bearer ${token}`;
-    }
-
-    const res = await fetch(`${API_URL}${path}`, {
-      ...options,
-      headers,
-    });
-
-    if (res.status === 401) {
-      this.clearToken();
-      if (typeof window !== "undefined") {
-        window.location.href = "/login";
-      }
-      throw new Error("Unauthorized");
-    }
-
-    if (!res.ok) {
-      const body = await res.json().catch(() => ({}));
-      throw new Error(body.detail || `HTTP ${res.status}`);
-    }
-
-    return res.json();
-  }
-
-  // Auth
+  // Auth via Supabase Auth
   async login(email: string, password: string) {
-    const data = await this.request<{ access_token: string; user: Record<string, string> }>("/api/v1/auth/login", {
-      method: "POST",
-      body: JSON.stringify({ email, password }),
-    });
-    this.setToken(data.access_token);
-    return data;
+    const { data, error } = await supabase.auth.signInWithPassword({ email, password });
+    if (error) throw new Error(error.message);
+    this.userId = data.user.id;
+    return { user: { email: data.user.email, id: data.user.id } };
   }
 
   async register(email: string, password: string, nome: string, whatsapp?: string) {
-    const data = await this.request<{ access_token: string; user: Record<string, string> }>("/api/v1/auth/register", {
-      method: "POST",
-      body: JSON.stringify({ email, password, nome, whatsapp }),
+    const { data, error } = await supabase.auth.signUp({
+      email,
+      password,
+      options: { data: { nome, whatsapp } },
     });
-    this.setToken(data.access_token);
-    return data;
+    if (error) throw new Error(error.message);
+    if (data.user) {
+      this.userId = data.user.id;
+      // Criar perfil na tabela usuarios
+      await supabase.from("usuarios").upsert({
+        id: data.user.id,
+        email,
+        password_hash: "supabase_auth",
+        nome,
+        whatsapp: whatsapp || null,
+        plano: "FREE",
+      });
+    }
+    return { user: { email, nome } };
   }
 
   async me() {
-    return this.request<Record<string, string>>("/api/v1/auth/me");
+    const { data: { user } } = await supabase.auth.getUser();
+    if (!user) throw new Error("Nao autenticado");
+    this.userId = user.id;
+    const { data } = await supabase
+      .from("usuarios")
+      .select("*")
+      .eq("id", user.id)
+      .single();
+    return data || { email: user.email, nome: user.user_metadata?.nome || "", plano: "FREE" };
+  }
+
+  async logout() {
+    await supabase.auth.signOut();
+    this.userId = null;
+  }
+
+  async isAuthenticated(): Promise<boolean> {
+    const { data: { session } } = await supabase.auth.getSession();
+    return !!session;
   }
 
   // Fazendas
   async listarFazendas() {
-    return this.request<Record<string, unknown>[]>("/api/v1/fazendas/");
+    const { data, error } = await supabase
+      .from("fazendas")
+      .select("*, talhoes(*)")
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
-  async criarFazenda(data: Record<string, unknown>) {
-    return this.request("/api/v1/fazendas/", { method: "POST", body: JSON.stringify(data) });
+  async criarFazenda(fazenda: Record<string, unknown>) {
+    const { data: { user } } = await supabase.auth.getUser();
+    const { data, error } = await supabase
+      .from("fazendas")
+      .insert({ ...fazenda, user_id: user?.id })
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+    return data;
   }
 
-  // Precos
+  // Precos Commodities
   async precosCommodities(commodity?: string, dias = 30) {
-    const params = new URLSearchParams({ dias: String(dias) });
-    if (commodity) params.set("commodity", commodity);
-    return this.request<Record<string, unknown>[]>(`/api/v1/precos/commodities?${params}`);
+    let query = supabase
+      .from("precos_commodities")
+      .select("*")
+      .gte("data", new Date(Date.now() - dias * 86400000).toISOString().slice(0, 10))
+      .order("data", { ascending: false });
+    if (commodity) query = query.eq("cultura", commodity);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
+  // Precos Futuros
   async precosFuturos(commodity?: string) {
-    const params = new URLSearchParams();
-    if (commodity) params.set("commodity", commodity);
-    return this.request<Record<string, unknown>[]>(`/api/v1/precos/futuros?${params}`);
+    let query = supabase
+      .from("precos_futuros")
+      .select("*")
+      .order("data", { ascending: false })
+      .limit(50);
+    if (commodity) query = query.eq("cultura", commodity);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
+  // Relacao de Troca
   async relacaoTroca(commodity = "SOJA", insumo = "UREIA", dias = 365) {
-    return this.request<Record<string, unknown>[]>(
-      `/api/v1/precos/relacao-troca?commodity=${commodity}&insumo=${insumo}&dias=${dias}`
-    );
+    const { data, error } = await supabase
+      .from("relacao_troca")
+      .select("*")
+      .eq("commodity", commodity)
+      .eq("insumo", insumo)
+      .gte("data", new Date(Date.now() - dias * 86400000).toISOString().slice(0, 10))
+      .order("data", { ascending: false });
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
-  // Clima
+  // Clima Historico
   async climaHistorico(lat: number, lon: number, dias = 90) {
-    return this.request<Record<string, unknown>[]>(
-      `/api/v1/clima/historico?latitude=${lat}&longitude=${lon}&dias=${dias}`
-    );
+    const tolerance = 0.5;
+    const { data, error } = await supabase
+      .from("dados_clima")
+      .select("*")
+      .gte("latitude", lat - tolerance)
+      .lte("latitude", lat + tolerance)
+      .gte("longitude", lon - tolerance)
+      .lte("longitude", lon + tolerance)
+      .gte("data", new Date(Date.now() - dias * 86400000).toISOString().slice(0, 10))
+      .order("data", { ascending: false });
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
+  // Clima Previsao
   async climaPrevisao(lat: number, lon: number) {
-    return this.request<Record<string, unknown>[]>(
-      `/api/v1/clima/previsao?latitude=${lat}&longitude=${lon}`
-    );
+    const tolerance = 0.5;
+    const { data, error } = await supabase
+      .from("previsao_clima")
+      .select("*")
+      .gte("latitude", lat - tolerance)
+      .lte("latitude", lat + tolerance)
+      .gte("longitude", lon - tolerance)
+      .lte("longitude", lon + tolerance)
+      .gte("data", new Date().toISOString().slice(0, 10))
+      .order("data", { ascending: true });
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
   // Insumos
-  async precosInsumos(categoria?: string, produto?: string) {
-    const params = new URLSearchParams();
-    if (categoria) params.set("categoria", categoria);
-    if (produto) params.set("produto", produto);
-    return this.request<Record<string, unknown>[]>(`/api/v1/insumos/precos?${params}`);
+  async precosInsumos(insumo?: string) {
+    let query = supabase
+      .from("precos_insumos")
+      .select("*")
+      .order("data", { ascending: false })
+      .limit(100);
+    if (insumo) query = query.eq("insumo", insumo);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return data || [];
+  }
+
+  // Dados Safra
+  async dadosSafra(cultura?: string, estado?: string) {
+    let query = supabase
+      .from("dados_safra")
+      .select("*")
+      .order("safra", { ascending: false })
+      .limit(20);
+    if (cultura) query = query.eq("cultura", cultura);
+    if (estado && estado !== "BR") query = query.eq("estado", estado);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
   // Alertas
   async listarAlertas() {
-    return this.request<Record<string, unknown>[]>("/api/v1/alertas/");
+    const { data, error } = await supabase
+      .from("alertas")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
-  async criarAlerta(data: Record<string, unknown>) {
-    return this.request("/api/v1/alertas/", { method: "POST", body: JSON.stringify(data) });
+  async criarAlerta(alerta: Record<string, unknown>) {
+    const { data: { user } } = await supabase.auth.getUser();
+    const { data, error } = await supabase
+      .from("alertas")
+      .insert({ ...alerta, user_id: user?.id })
+      .select()
+      .single();
+    if (error) throw new Error(error.message);
+    return data;
+  }
+
+  async deletarAlerta(id: string) {
+    const { error } = await supabase.from("alertas").delete().eq("id", id);
+    if (error) throw new Error(error.message);
   }
 
   // Recomendacoes
   async listarRecomendacoes(tipo?: string) {
-    const params = new URLSearchParams();
-    if (tipo) params.set("tipo", tipo);
-    return this.request<Record<string, unknown>[]>(`/api/v1/recomendacoes/?${params}`);
+    let query = supabase
+      .from("recomendacoes")
+      .select("*")
+      .order("created_at", { ascending: false });
+    if (tipo) query = query.eq("tipo", tipo);
+    const { data, error } = await query;
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 
+  // Eventos de Mercado
   async eventosMercado() {
-    return this.request<Record<string, unknown>[]>("/api/v1/recomendacoes/eventos");
+    const { data, error } = await supabase
+      .from("eventos_mercado")
+      .select("*")
+      .order("created_at", { ascending: false })
+      .limit(20);
+    if (error) throw new Error(error.message);
+    return data || [];
   }
 }
 

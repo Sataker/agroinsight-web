@@ -13,8 +13,9 @@ export function Topbar({ onMenuToggle }: { onMenuToggle?: () => void }) {
       <div className="flex items-center gap-4">
         <span className="text-sm text-gray-500 hidden sm:block">Produtor</span>
         <button
-          onClick={() => {
-            localStorage.removeItem("agroinsight_token");
+          onClick={async () => {
+            const { supabase } = await import("@/lib/supabase");
+            await supabase.auth.signOut();
             window.location.href = "/login";
           }}
           className="text-sm text-red-500 hover:text-red-700"
