@@ -6,6 +6,9 @@
 -- Extensoes
 CREATE EXTENSION IF NOT EXISTS "uuid-ossp";
 
+-- Dropar tabela usuarios existente (tipo id incompativel)
+DROP TABLE IF EXISTS usuarios CASCADE;
+
 -- ============================================
 -- 1. USUARIOS
 -- ============================================
